@@ -1,0 +1,175 @@
+name: Personal PR Triage + Auto Close (All Repos)
+
+on:
+  schedule:
+    # 7:00 PM America/Los_Angeles during PST (UTC-8) ≈ 03:00 UTC next day
+    # Note: during PDT this will run ~8pm local unless you adjust seasonally.
+    - cron: "0 3 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  # This applies to the automation repo; cross-repo access is via PERSONAL_GH_TOKEN
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.PERSONAL_GH_TOKEN }}
+      STALE_DAYS: "15"
+      DRAFT_HOURS: "24"
+      # Labels that prevent auto-close
+      PROTECT_LABELS: "in-progress,wip,do-not-close"
+      # Set to 1 if you want extra logging
+      VERBOSE: "0"
+    steps:
+      - name: Sanity check auth
+        run: |
+          set -euo pipefail
+          gh --version
+          gh auth status
+
+      - name: Triage PRs across all owned repos
+        run: |
+          set -euo pipefail
+
+          now_epoch="$(date -u +%s)"
+          stale_cutoff="$(( now_epoch - STALE_DAYS*24*3600 ))"
+          draft_cutoff="$(( now_epoch - DRAFT_HOURS*3600 ))"
+
+          echo "Policy: close PRs inactive >${STALE_DAYS} days; close drafts older than ${DRAFT_HOURS}h"
+          echo "Protected labels: ${PROTECT_LABELS}"
+          echo "UTC now: $(date -u)"
+
+          # Get your username (login)
+          me="$(gh api /user --jq '.login')"
+          echo "Acting as: $me"
+
+          # Fetch all repos you own (paginate)
+          page=1
+          repos=()
+          while true; do
+            chunk="$(gh api "/user/repos?per_page=100&page=$page&affiliation=owner&sort=updated" \
+              --jq '[.[] | select(.archived == false) | .full_name]')"
+            len="$(echo "$chunk" | jq 'length')"
+            if [ "$len" -eq 0 ]; then
+              break
+            fi
+            while read -r r; do
+              [ -n "$r" ] && repos+=("$r")
+            done < <(echo "$chunk" | jq -r '.[]')
+            page=$((page+1))
+          done
+
+          echo "Found ${#repos[@]} non-archived owned repos."
+
+          # Helper: check if labels contain any protected label
+          has_protected_label () {
+            local labels_csv="$1"
+            IFS=',' read -ra protected <<< "$PROTECT_LABELS"
+            for p in "${protected[@]}"; do
+              p_trim="$(echo "$p" | xargs)"
+              if [ -n "$p_trim" ] && echo ",$labels_csv," | grep -qi ",$p_trim,"; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          triaged=0
+          closed=0
+          deleted=0
+          skipped=0
+
+          for repo_full in "${repos[@]}"; do
+            owner="${repo_full%/*}"
+            repo="${repo_full#*/}"
+
+            echo ""
+            echo "=== Repo: $repo_full ==="
+
+            # List open PRs in this repo (paginate)
+            pr_page=1
+            while true; do
+              prs="$(gh api -H "Accept: application/vnd.github+json" \
+                "/repos/$owner/$repo/pulls?state=open&per_page=100&page=$pr_page")"
+
+              pr_len="$(echo "$prs" | jq 'length')"
+              if [ "$pr_len" -eq 0 ]; then
+                break
+              fi
+
+              echo "$prs" | jq -c '.[]' | while read -r pr; do
+                triaged=$((triaged+1))
+
+                number="$(echo "$pr" | jq -r '.number')"
+                draft="$(echo "$pr" | jq -r '.draft')"
+                created_at="$(echo "$pr" | jq -r '.created_at')"
+                updated_at="$(echo "$pr" | jq -r '.updated_at')"
+                title="$(echo "$pr" | jq -r '.title' | tr '\n' ' ' | sed 's/  */ /g')"
+
+                head_ref="$(echo "$pr" | jq -r '.head.ref')"
+                head_repo_full="$(echo "$pr" | jq -r '.head.repo.full_name')"
+                base_repo_full="$(echo "$pr" | jq -r '.base.repo.full_name')"
+
+                labels_csv="$(echo "$pr" | jq -r '[.labels[].name] | join(",")')"
+
+                if has_protected_label "$labels_csv"; then
+                  echo "🟢 #$number protected by label ($labels_csv) — skipping"
+                  skipped=$((skipped+1))
+                  return 0
+                fi
+
+                created_epoch="$(date -u -d "$created_at" +%s)"
+                updated_epoch="$(date -u -d "$updated_at" +%s)"
+
+                # Rule 1: Draft older than DRAFT_HOURS
+                if [ "$draft" = "true" ] && [ "$created_epoch" -lt "$draft_cutoff" ]; then
+                  echo "🟠 Closing DRAFT #$number (>${DRAFT_HOURS}h old): $title"
+                  gh pr close "$number" -R "$repo_full" \
+                    --comment "Auto-closed: draft PR older than ${DRAFT_HOURS}h. Reopen if still needed."
+                  closed=$((closed+1))
+
+                  # Delete branch if it's in the same repo (not a fork)
+                  if [ "$head_repo_full" = "$base_repo_full" ]; then
+                    echo "🗑️ Deleting branch '$head_ref' for #$number"
+                    gh api -X DELETE "/repos/$repo_full/git/refs/heads/$head_ref" >/dev/null 2>&1 || true
+                    deleted=$((deleted+1))
+                  else
+                    echo "ℹ️ Not deleting branch (fork): head=$head_repo_full base=$base_repo_full"
+                  fi
+                  return 0
+                fi
+
+                # Rule 2: Stale by updated_at
+                if [ "$updated_epoch" -lt "$stale_cutoff" ]; then
+                  echo "🟠 Closing STALE #$number (inactive >${STALE_DAYS} days): $title"
+                  gh pr close "$number" -R "$repo_full" \
+                    --comment "Auto-closed: no activity for ${STALE_DAYS}+ days. Reopen if still relevant."
+                  closed=$((closed+1))
+
+                  if [ "$head_repo_full" = "$base_repo_full" ]; then
+                    echo "🗑️ Deleting branch '$head_ref' for #$number"
+                    gh api -X DELETE "/repos/$repo_full/git/refs/heads/$head_ref" >/dev/null 2>&1 || true
+                    deleted=$((deleted+1))
+                  else
+                    echo "ℹ️ Not deleting branch (fork): head=$head_repo_full base=$base_repo_full"
+                  fi
+                  return 0
+                fi
+
+                if [ "${VERBOSE}" = "1" ]; then
+                  echo "⚪ #$number ok (draft=$draft, labels=$labels_csv, updated=$updated_at)"
+                fi
+              done
+
+              pr_page=$((pr_page+1))
+            done
+          done
+
+          echo ""
+          echo "✅ Summary:"
+          echo "Triaged PRs: $triaged"
+          echo "Closed PRs:   $closed"
+          echo "Branches deleted (best-effort): $deleted"
+          echo "Skipped (protected label): $skipped"
